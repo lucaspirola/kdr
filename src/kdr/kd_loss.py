@@ -174,7 +174,7 @@ def forward_kld_loss(
     in bf16.
 
     Pad/mask contract: the calibration tensor produced by
-    `moe_compress.utils.calibration._tokenize_to_fixed_length` is fully
+    `kdr.data.calibration._tokenize_to_fixed_length` is fully
     packed (concatenated streams separated by EOS, hard 5%-shortage cap).
     Every position is a real token, so per-position averaging is correct
     without an attention_mask. If a future call site feeds pad-bearing

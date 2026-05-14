@@ -12,8 +12,8 @@ So this script runs in seconds, uses <100 MB RAM, and iterates as fast as
 you can edit /home/lucas/ai/transformers-zaya1.
 
 Usage:
-    /home/lucas/ai/moe_compress/knowledge_distillation_recovery/kdr/.venv-kdr/bin/python \\
-        /home/lucas/ai/zaya1-load-test/inspect_shapes.py
+    /home/lucas/ai/kdr/.venv/bin/python \\
+        /home/lucas/ai/kdr/tools/inspect_shapes.py
 """
 
 from __future__ import annotations

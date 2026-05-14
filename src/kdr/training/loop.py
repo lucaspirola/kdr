@@ -78,9 +78,9 @@ def run_recovery(
             pass a fake).
         artifacts_dir: where partial + final dirs are written.
         batches: pre-tokenized calibration micro-batches, each a `[B, T]`
-            `torch.long` tensor. Decoupled from `moe_compress.utils.calibration`
-            so kdr is testable without that sibling project; the CLI builds
-            this list via the production calibration path.
+            `torch.long` tensor. Decoupled from `kdr.data.calibration` so the
+            loop is testable without invoking the calibration pipeline; the
+            CLI builds this list via the production calibration path.
         resume_step: 0-based optimizer step to resume from. The caller
             (CLI) discovered this via `find_latest_partial`.
         source_metadata_path: optional path to the input student's

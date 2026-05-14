@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # kdr vast.ai container bootstrap.
 #
-# Pulls the moe_compress repo (the image is shared with max_quality and ships
-# only deps + this script), installs Zyphra's transformers fork over the base
-# image's stock transformers, snapshot-downloads teacher + student into the
-# cache mount, derives the deterministic run_id, queries HF Hub for prior
-# partials, and invokes the trainer with --resume-from if applicable.
+# Pulls the kdr repo (the image ships only deps + this script), installs
+# Zyphra's transformers fork over the base image's stock transformers,
+# snapshot-downloads teacher + student into the cache mount, derives the
+# deterministic run_id, queries HF Hub for prior partials, and invokes the
+# trainer with --resume-from if applicable.
 #
 # Implements LLR-0008 (CLI surface), LLR-0031 (run_id), LLR-0032 (env-var
 # validation), LLR-0033 (partials query), LLR-0035 (Zyphra fork install).
@@ -48,8 +48,8 @@ Required environment variables:
 Optional:
   PARTIALS_REPO_PREFIX     Default "pirola/kdr-partials". Final repo: "{prefix}-{run_id}".
   RECOVERED_REPO_PREFIX    Default "pirola/kdr-recovered". Final repo: "{prefix}-{run_id}".
-  MOE_COMPRESS_GIT_URL     Default https://github.com/lucaspirola/moe_compress.git
-  MOE_COMPRESS_GIT_REF     Default "main".
+  KDR_GIT_URL              Default https://github.com/lucaspirola/kdr.git
+  KDR_GIT_REF              Default "main".
 USAGE
     exit 2
 }
@@ -79,8 +79,8 @@ esac
 
 PARTIALS_REPO_PREFIX="${PARTIALS_REPO_PREFIX:-pirola/kdr-partials}"
 RECOVERED_REPO_PREFIX="${RECOVERED_REPO_PREFIX:-pirola/kdr-recovered}"
-MOE_COMPRESS_GIT_URL="${MOE_COMPRESS_GIT_URL:-https://github.com/lucaspirola/moe_compress.git}"
-MOE_COMPRESS_GIT_REF="${MOE_COMPRESS_GIT_REF:-main}"
+KDR_GIT_URL="${KDR_GIT_URL:-https://github.com/lucaspirola/kdr.git}"
+KDR_GIT_REF="${KDR_GIT_REF:-main}"
 
 # Export HF_TOKEN so huggingface_hub picks it up automatically (no `login` step).
 export HF_TOKEN
@@ -104,33 +104,26 @@ export KDR_IQ2XS_BF16_ARGMIN=1
 # 2. Repo clone (depth=1, ref-pinned, hard-reset on re-launch)
 # ─────────────────────────────────────────────────────────────────────────────
 
-REPO_DIR="${CACHE_MOUNT}/moe_compress"
+REPO_DIR="${CACHE_MOUNT}/kdr"
 if [[ ! -d "${REPO_DIR}/.git" ]]; then
-    echo ">>> Cloning ${MOE_COMPRESS_GIT_URL}@${MOE_COMPRESS_GIT_REF} into ${REPO_DIR}"
-    if ! git clone --depth=1 --branch "${MOE_COMPRESS_GIT_REF}" "${MOE_COMPRESS_GIT_URL}" "${REPO_DIR}"; then
+    echo ">>> Cloning ${KDR_GIT_URL}@${KDR_GIT_REF} into ${REPO_DIR}"
+    if ! git clone --depth=1 --branch "${KDR_GIT_REF}" "${KDR_GIT_URL}" "${REPO_DIR}"; then
         echo "ERROR: git clone failed." >&2
         exit 4
     fi
 else
     # Re-launch on a persistent volume: discard any local mutations from the
     # prior run (partial pip installs, half-applied patches) before fetching.
-    echo ">>> Repo already cloned at ${REPO_DIR}; hard-resetting to origin/${MOE_COMPRESS_GIT_REF}"
-    git -C "${REPO_DIR}" fetch --depth=1 origin "${MOE_COMPRESS_GIT_REF}"
-    git -C "${REPO_DIR}" reset --hard "origin/${MOE_COMPRESS_GIT_REF}"
+    echo ">>> Repo already cloned at ${REPO_DIR}; hard-resetting to origin/${KDR_GIT_REF}"
+    git -C "${REPO_DIR}" fetch --depth=1 origin "${KDR_GIT_REF}"
+    git -C "${REPO_DIR}" reset --hard "origin/${KDR_GIT_REF}"
 fi
 
-cd "${REPO_DIR}/knowledge_distillation_recovery/kdr"
+cd "${REPO_DIR}"
 pip install -e . --no-deps --quiet || {
     echo "ERROR: kdr package install failed." >&2
     exit 4
 }
-
-# kdr's CLI imports `moe_compress.utils.calibration` from the sibling
-# max_quality project, which has no pyproject.toml (it's PYTHONPATH-imported,
-# matching max_quality/docker/bootstrap.sh's own pattern). Without this
-# export the trainer dies at calibration-batch construction with
-# `ModuleNotFoundError: No module named 'moe_compress'`.
-export PYTHONPATH="${REPO_DIR}/max_quality/src${PYTHONPATH:+:${PYTHONPATH}}"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 3. Zyphra transformers fork install (LLR-0035)

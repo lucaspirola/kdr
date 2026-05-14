@@ -213,10 +213,8 @@ def main(argv: list[str] | None = None) -> int:
     adapter = Zaya1Adapter()
     source_metadata_path = _resolve_source_metadata_path(config.student.source)
 
-    # Calibration batches: production builds them via moe_compress.utils;
-    # extracted here so tests can monkey-patch a synthetic builder. The lazy
-    # import keeps kdr importable in environments without moe_compress (e.g.
-    # this WSL dev box).
+    # Calibration batches: extracted here so tests can monkey-patch a
+    # synthetic builder.
     batches = _build_calibration_batches(config, accelerator)
 
     out_dir = run_recovery(
@@ -268,27 +266,20 @@ def _build_calibration_batches(
 ) -> list[torch.Tensor]:
     """Build the calibration tensor and yield it as a list of micro-batches.
 
-    Lazy-imports `moe_compress.utils.calibration` (a sibling project, NOT a
-    kdr install dep). The function is split out so unit tests can patch
+    Imports from the vendored `kdr.data.calibration` module (originally
+    sourced from `moe_compress.utils.calibration` and now part of kdr's
+    own tree). The function is split out so unit tests can patch
     `_build_calibration_batches` directly without touching the rest of the
     CLI.
     """
-    try:
-        from moe_compress.utils.calibration import (  # type: ignore[import-not-found]
-            build_calibration_tensor,
-            iter_batches,
-            spec_from_config,
-        )
-    except ImportError as err:
-        raise RuntimeError(
-            "moe_compress is not installed. The CLI's calibration path "
-            "depends on `moe_compress.utils.calibration` from the sibling "
-            "max_quality project; install it (or invoke kdr's library API "
-            "with pre-built `batches` directly)."
-        ) from err
+    from kdr.data.calibration import (
+        build_calibration_tensor,
+        iter_batches,
+        spec_from_config,
+    )
 
-    # Calibration cache is decided by moe_compress (default
-    # ./artifacts/_calibration_cache, CWD-relative). Rely on the API's
+    # Calibration cache lives at the kdr.data.calibration default
+    # (./artifacts/_calibration_cache, CWD-relative). Rely on the API's
     # default — its signature types `cache_dir: str | Path` and would
     # TypeError on None.
     spec = spec_from_config(

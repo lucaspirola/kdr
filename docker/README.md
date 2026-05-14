@@ -1,9 +1,8 @@
 # kdr — vast.ai operator runbook
 
 Self-contained guide to launching a kdr training job on a vast.ai
-instance. The base image is shared with `max_quality`
-(`ghcr.io/lucaspirola/moe-compress:latest`); kdr ships only `bootstrap.sh`
-and this file.
+instance. The image is `ghcr.io/lucaspirola/kdr:latest` (carries deps + the
+bootstrap script; code is cloned from this repo at container start).
 
 ## Hardware tier
 
@@ -43,7 +42,7 @@ or via the dashboard's "Environment" pane.
 | `HF_TOKEN`      | HF Hub token with **write** access to the partials + recovered repos.         |
 | `STUDENT_REPO`  | HF Hub repo ID of the student model. ZAYA1: `Zyphra/ZAYA1-reasoning-base`.    |
 | `CACHE_MOUNT`   | Absolute path on the instance for snapshots + artifacts. e.g. `/workspace`.   |
-| `KDR_CONFIG`    | YAML config path. Repo-relative or absolute. e.g. `knowledge_distillation_recovery/kdr/configs/zaya1_8b_da_qad_nvfp4_int4kv.yaml`. |
+| `KDR_CONFIG`    | YAML config path. Repo-relative or absolute. e.g. `configs/zaya1_8b_da_qad_profileJ_gguf.yaml`. |
 | `KDR_MODE`      | `"bf16"` or `"da_qad"`. Embedded in `run_id`.                                 |
 
 Optional:
@@ -52,8 +51,8 @@ Optional:
 | ------------------------- | ---------------------------------------------- |
 | `PARTIALS_REPO_PREFIX`    | `pirola/kdr-partials` (suffix `-{run_id}`)     |
 | `RECOVERED_REPO_PREFIX`   | `pirola/kdr-recovered` (suffix `-{run_id}`)    |
-| `MOE_COMPRESS_GIT_URL`    | `https://github.com/lucaspirola/moe_compress.git` |
-| `MOE_COMPRESS_GIT_REF`    | `main`                                         |
+| `KDR_GIT_URL`             | `https://github.com/lucaspirola/kdr.git`       |
+| `KDR_GIT_REF`             | `main`                                         |
 
 `bootstrap.sh` aborts (exit 2) with a clear message if any required var is
 unset or empty.
@@ -61,8 +60,11 @@ unset or empty.
 ## Running
 
 ```bash
-# On a freshly-launched vast.ai instance with the moe_compress image:
-curl -sSL https://raw.githubusercontent.com/lucaspirola/moe_compress/main/knowledge_distillation_recovery/kdr/docker/bootstrap.sh \
+# On a freshly-launched vast.ai instance with the kdr image
+# (ghcr.io/lucaspirola/kdr:latest), bootstrap.sh is already at
+# /usr/local/bin/bootstrap.sh and runs as ENTRYPOINT. To fetch it
+# manually:
+curl -sSL https://raw.githubusercontent.com/lucaspirola/kdr/main/docker/bootstrap.sh \
     | bash
 ```
 
@@ -75,7 +77,7 @@ Or, equivalently, pre-bake the script into the launch command:
 Sequence (per `bootstrap.sh`):
 
 1. **Env-var validation** (LLR-0032). Fail fast before downloading 17 GB.
-2. **Repo clone** of `moe_compress` at the configured ref into `${CACHE_MOUNT}/moe_compress`.
+2. **Repo clone** of `kdr` at the configured ref into `${CACHE_MOUNT}/kdr`.
 3. **Zyphra transformers fork install** (LLR-0035). `force-reinstall` over the
    image's stock transformers; required for `ZayaForCausalLM`.
 4. **HF auth** + `snapshot_download` of the student into `${CACHE_MOUNT}/student`.
@@ -141,7 +143,7 @@ curl -sSf "https://console.vast.ai/api/v0/instances/${VAST_INSTANCE_ID}/" \
 | 3         | Zyphra transformers fork install failed                | Check network; fork moved? See LLR-0035   |
 | 4         | git clone or snapshot_download failed                  | Check `HF_TOKEN` scope; check disk space  |
 | 5         | Trainer crashed mid-run                                | Check stderr; if persistent, file an issue. Re-launching against the same `run_id` resumes from the latest partial |
-| 6         | Final artifact uploaded but `from_pretrained` round-trip failed in a fresh Python process | Artifact is on HF Hub; inspect the load error. Common causes: missing tokenizer files in the save (kdr bug — file an issue), Zyphra transformers fork mismatch (re-pin `MOE_COMPRESS_GIT_REF`), or HF Hub propagation lag (rare; relaunch after a few minutes — the run is idempotent on the same `run_id`) |
+| 6         | Final artifact uploaded but `from_pretrained` round-trip failed in a fresh Python process | Artifact is on HF Hub; inspect the load error. Common causes: missing tokenizer files in the save (kdr bug — file an issue), Zyphra transformers fork mismatch (re-pin `KDR_GIT_REF`), or HF Hub propagation lag (rare; relaunch after a few minutes — the run is idempotent on the same `run_id`) |
 
 ## Out of scope
 
