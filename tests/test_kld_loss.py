@@ -292,3 +292,58 @@ def test_cache_thread_race_same_key_returns_identical_instance() -> None:
         "two threads got different cached instances — double-checked locking failed "
         "(removing _CACHE_LOCK in kd_loss.py would reproduce this)"
     )
+
+
+# ─── Phase 7.2: top-k FKLD with tail-mass correction ─────────────────────────
+
+
+def test_topk_fkld_matches_full_in_limit() -> None:
+    """k == V (no truncation) → top-k path matches the reference KL.
+
+    At k == V, p_tail collapses to ~0 and the top-k sum equals the full KL.
+    Tolerance accounts for the different summation order between
+    `(p * (log p - log q)).sum` and `F.kl_div(..., 'batchmean')`.
+    """
+    torch.manual_seed(0)
+    student = torch.randn(8, 64) * 2.0
+    teacher = torch.randn(8, 64) * 2.0
+    expected = _torch_native_forward_kld(student, teacher, temperature=1.0)
+    got = forward_kld_loss(student, teacher, temperature=1.0, kd_topk=64)
+    assert got.item() == pytest.approx(expected.item(), rel=1e-4, abs=1e-5)
+
+
+def test_topk_fkld_bias_bounded_at_half_vocab() -> None:
+    """k == V/2 with a near-uniform teacher → KL value within a small bound
+    of the full-vocab reference. The tail-mass correction term keeps the
+    estimator nearly unbiased even for moderate k.
+    """
+    torch.manual_seed(0)
+    # Sharper teacher so the top-32 covers most of the probability mass.
+    teacher = torch.randn(16, 64) * 3.0
+    student = torch.randn(16, 64) * 1.5
+    expected = _torch_native_forward_kld(student, teacher, temperature=1.0)
+    got = forward_kld_loss(student, teacher, temperature=1.0, kd_topk=32)
+    # The top-32 of a peaky 64-vocab distribution carries the bulk of the
+    # mass; with the tail correction, bias is well under 5% relative.
+    assert got.item() == pytest.approx(expected.item(), rel=0.05, abs=1e-3)
+
+
+def test_topk_fkld_gradient_flows_to_student() -> None:
+    """Backward through the top-k path produces non-zero student grads."""
+    torch.manual_seed(0)
+    student = torch.randn(4, 32, requires_grad=True)
+    teacher = torch.randn(4, 32)
+    loss = forward_kld_loss(student, teacher, temperature=2.0, kd_topk=8)
+    loss.backward()
+    assert student.grad is not None
+    assert torch.any(student.grad != 0.0), "no gradient flowed to student logits"
+
+
+def test_topk_none_preserves_full_vocab_path() -> None:
+    """`kd_topk=None` does not change the existing loss value."""
+    torch.manual_seed(0)
+    student = torch.randn(2, 32)
+    teacher = torch.randn(2, 32)
+    base = forward_kld_loss(student, teacher, temperature=1.0, kd_topk=None)
+    expected = _torch_native_forward_kld(student, teacher, temperature=1.0)
+    assert base.item() == pytest.approx(expected.item(), rel=1e-5, abs=1e-6)

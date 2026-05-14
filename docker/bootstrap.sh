@@ -93,6 +93,13 @@ export TORCH_EXTENSIONS_DIR="${CACHE_MOUNT}/torch_ext"
 
 mkdir -p "${CACHE_MOUNT}" "${HF_HOME}" "${TORCH_EXTENSIONS_DIR}"
 
+# IQ2_XS bf16 codebook-search path (Phase 7.2 perf flag). Already implemented
+# and parity-tested at kdr/quant/native_backend/ste_simulators.py:53-67;
+# 2× faster than the fp32 path on the cache-miss path, ≥99% argmin identity
+# gated by tests/test_iq2_xs_bf16_argmin.py. Exported here so every
+# B200/H200 launch picks it up; no YAML field needed.
+export KDR_IQ2XS_BF16_ARGMIN=1
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. Repo clone (depth=1, ref-pinned, hard-reset on re-launch)
 # ─────────────────────────────────────────────────────────────────────────────

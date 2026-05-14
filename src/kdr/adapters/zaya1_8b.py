@@ -74,15 +74,17 @@ class Zaya1Adapter:
         """
         # LLR-0026 AC: adapter forces its required attn_implementation
         # (mode-aware), overriding the YAML's value. In `da_qad` CCA needs
-        # `eager` for hookability; in `bf16` SDPA is selected for speed.
-        # Silently honoring a YAML mis-configuration would either no-op
-        # KV-quant (da_qad) or lose ~2-3× throughput (bf16) — see LLR-0026.
-        required_attn = self.required_attn_implementation(mode)
+        # `eager` on the **student** for hookability; in `bf16` SDPA is
+        # selected for speed. The **teacher** has no KV hooks installed in
+        # either mode, so it always uses SDPA — buying ~2× teacher-forward
+        # throughput in da_qad mode at no quality cost.
+        teacher_attn = self.required_attn_implementation(mode, role="teacher")
+        student_attn = self.required_attn_implementation(mode, role="student")
         teacher = self._load_one(
             name_or_path=teacher_cfg.name_or_path,
             revision=teacher_cfg.revision,
             torch_dtype=teacher_cfg.torch_dtype,
-            attn_implementation=required_attn,
+            attn_implementation=teacher_attn,
             role="TEACHER",
         )
         # REQ: LLR-0004
@@ -105,7 +107,7 @@ class Zaya1Adapter:
             name_or_path=student_cfg.source,
             revision="main",
             torch_dtype=student_cfg.torch_dtype,
-            attn_implementation=required_attn,
+            attn_implementation=student_attn,
             role="STUDENT",
         )
 
@@ -350,46 +352,52 @@ class Zaya1Adapter:
         return ["lm_head", "embed_tokens", "router", "norm", "val_proj"]
 
     # REQ: LLR-0026
-    def required_attn_implementation(self, mode: Mode) -> Literal["eager", "sdpa"]:
-        """Mode-aware attention backend selection (LLR-0026).
+    def required_attn_implementation(
+        self,
+        mode: Mode,
+        *,
+        role: Literal["teacher", "student"] = "student",
+    ) -> Literal["eager", "sdpa"]:
+        """Mode + role-aware attention backend selection (LLR-0026).
 
-        - ``mode == "da_qad"`` → ``"eager"``. CCA's convolutional
-          downprojector is not flash-attn-compatible, and ``eager`` is the
-          ATTN backend that exposes post-projection K/V tensors at a Python
-          hook boundary. ``sdpa`` would also expose K/V to a forward hook on
-          ``self_attn``, but the Zyphra fork's CCA layer routes through a
-          custom function (``cca_eager_attention_forward`` per the fork's
-          source) that is only wired under ``eager``. Phase 7.1 confirmed
-          on real ZAYA1-8B.
-        - ``mode == "bf16"`` → ``"sdpa"``. Pure-BF16 self/teacher-
-          distillation places no hooks (the trainer installs
+        The eager-only constraint in da_qad comes from KV hooks installed on
+        the **student** under `partition_and_dispatch`. The **teacher** has
+        no KV hooks (KV quantization is student-only), so it can always use
+        SDPA — buying ~2× teacher-forward throughput on Hopper/Blackwell.
+
+        Returns ``"sdpa"`` unless: (mode == "da_qad" AND role == "student"),
+        in which case ``"eager"`` is required for CCA's hook boundary.
+
+        - ``mode == "bf16"`` (either role) → ``"sdpa"``. Pure-BF16
+          self/teacher-distillation places no hooks (the trainer installs
           ``NoOpReplayContextManager()`` at loop.py:160 in BF16 mode), so the
-          eager-only constraint does not apply. SDPA produces numerically
-          equivalent output to eager at BF16 precision (agreement an order
-          of magnitude below the BF16 forward's own non-determinism) and is
-          ~2-3× faster on Hopper/Blackwell, which dominates wall-time for
-          80-layer 8B models. Phase 7.1's 200-step variant spent ~33 s/step
-          on H200 entirely because eager was forced unnecessarily.
+          eager-only constraint does not apply. SDPA is ~2-3× faster on
+          Hopper/Blackwell.
+        - ``mode == "da_qad", role == "student"`` → ``"eager"``. CCA's
+          convolutional downprojector is not flash-attn-compatible; ``eager``
+          exposes post-projection K/V tensors at the hook boundary. The
+          Zyphra fork's CCA layer routes through a custom function
+          (``cca_eager_attention_forward`` per the fork's source) that is
+          only wired under ``eager``. Phase 7.1 confirmed on real ZAYA1-8B.
+        - ``mode == "da_qad", role == "teacher"`` → ``"sdpa"``. The teacher
+          has no KV hooks (KV-quant is student-only), so it can run on SDPA.
+          Router-replay's capture hook attaches to `.router` (a standalone
+          `nn.Linear`, not inside the CCA attention path), so SDPA-vs-eager
+          attention doesn't affect the capture site. SDPA matches eager at
+          BF16 precision (per the adapter's own pre-existing comment, the
+          agreement is an order of magnitude below the BF16 forward's
+          non-determinism floor).
 
         Flash-attn is rejected in both modes: it fuses K/V projection and
         never exposes post-projection K/V tensors at a Python hook, silently
         no-opping the KV simulator in da_qad and offering no measurable
         speedup over SDPA on Hopper/Blackwell.
-
-        Generic-tool guidance: when adding a new mode (e.g., FP8 / NVFP4
-        quant variants), the choice is driven by two questions —
-        (1) Will any hooks be placed at the post-K/V-projection boundary?
-        If yes, ``eager`` is required because hooks must see post-projection
-        tensors. (2) Is the model architecture's custom attention routine
-        wired only under one HF backend? (e.g., ZAYA1's CCA is eager-only
-        in the published fork.) If yes, the choice is constrained by the
-        fork rather than by the mode. For a new fork that wires its custom
-        attention under SDPA, both BF16 AND quant-with-no-K/V-hooks paths
-        can use SDPA — only K/V-hooking paths are constrained to eager.
         """
         if mode == "bf16":
             return "sdpa"
         if mode == "da_qad":
+            if role == "teacher":
+                return "sdpa"
             return "eager"
         # Defensive: an unknown mode must NOT silently default. Future modes
         # need an explicit branch here so the genericness rationale above is

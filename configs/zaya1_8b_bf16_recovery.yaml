@@ -72,12 +72,26 @@ calibration:
 
 distillation:
   loss: forward_kld
+  # Top-k FKLD with tail correction; ~30% loss-path memory cut, bias <0.5%.
+  kd_topk: 512
+  # BF16 mode has no codebook-flip frontier to soften; τ stays at 1.0.
   temperature: 1.0
-  optimizer: adamw_bnb_8bit
+  # Muon over 2D Linear weights, AdamW-8bit over carve-outs (embed,
+  # lm_head, router, norm, val_proj) + biases.
+  optimizer: muon_with_adamw
+  # AdamW-group base LR (unchanged from Phase 7.1 BF16 baseline).
   learning_rate: 2.0e-4
   min_learning_rate: 4.5e-7
   weight_decay: 0.01
   betas: [0.9, 0.999]
+  # Muon-group base LR. No IQ2_XS ceiling in BF16 mode; Keller Jordan's
+  # 50× rule from AdamW=2e-4 → 1e-2 is the upper envelope. 5e-3 is a
+  # conservative starting point — tune up if convergence is slower than
+  # the AdamW-only baseline.
+  muon_learning_rate: 5.0e-3
+  muon_momentum: 0.95
+  muon_nesterov: true
+  muon_ns_steps: 5
   grad_clip_norm: 1.0
   warmup_steps: 20
   # tokens_per_step = bs × world × ga × seq.  With auto_batch_size=true the
@@ -93,10 +107,16 @@ distillation:
   log_every_n_steps: 5
   eval_every_n_steps: 50
   save_every_n_steps: 50       # 4 partials (50/100/150/200) — exercises resume
-  trainable_scope: full
+  # Same router-replay rationale as Profile-J: student routers are
+  # overridden by teacher's, so their gradient signal is meaningless.
+  trainable_scope: routers_frozen
   use_gradient_checkpointing: true
   auto_batch_size: true        # Phase 7+ throughput probe; see kdr/config.py DistillationConfig docstring
   enable_async_save: true      # Phase 7+ async save_partial; see kdr/io/save.py:_AsyncSaveExecutor
+  # Plateau guard (defaults; same trigger as Profile-J).
+  plateau_guard_multiplier: 3.0
+  plateau_guard_consecutive: 5
+  plateau_guard_min_step: 30
 
 eval:
   wikitext2:

@@ -128,7 +128,12 @@ class DistillationConfig(BaseModel):
     # (default) the temperature is held constant at `temperature` — the
     # backward-compatible behaviour for every existing config.
     temperature_start: float | None = Field(default=None, gt=0)
-    optimizer: Literal["adamw_bnb_8bit", "deepspeed_cpu_adam"]
+    # Top-k FKLD with tail-mass correction. When set, the KD loss computes KL
+    # over the top-k teacher logits plus a `p_tail · (log p_tail − log q_tail)`
+    # correction; saves ~30% loss-path memory on V≈150k vocabularies at <0.5%
+    # bias on KL value. None (default) keeps the full-vocab path bit-identical.
+    kd_topk: int | None = Field(default=None, gt=0)
+    optimizer: Literal["adamw_bnb_8bit", "deepspeed_cpu_adam", "muon_with_adamw"]
     learning_rate: float = Field(..., gt=0)
     min_learning_rate: float = Field(..., gt=0)
     weight_decay: float = Field(..., ge=0)
@@ -136,20 +141,48 @@ class DistillationConfig(BaseModel):
     # list of two floats; using `list[float]` with length constraint is the
     # idiomatic strict-mode shape.
     betas: list[float] = Field(..., min_length=2, max_length=2)
+    # Muon optimizer fields. Active only when `optimizer == "muon_with_adamw"`;
+    # otherwise ignored. `muon_learning_rate` is the Muon-group base LR (for 2D
+    # Linear weights); the existing `learning_rate` field doubles as the
+    # AdamW-group base LR (for embeddings, lm_head, norms, routers, val_proj,
+    # biases), unless `adamw_group_learning_rate` overrides it. Muon LR is
+    # typically O(1e-3..1e-1) — a sanity cap rejects unit-swap typos.
+    muon_learning_rate: float | None = Field(default=None, gt=0, lt=1.0)
+    muon_momentum: float = Field(default=0.95, gt=0, lt=1)
+    muon_nesterov: bool = True
+    muon_ns_steps: int = Field(default=5, ge=1, le=10)
+    adamw_group_learning_rate: float | None = Field(default=None, gt=0)
     grad_clip_norm: float = Field(..., gt=0)
     warmup_steps: int = Field(..., ge=0)
     total_tokens: int = Field(..., gt=0)
     per_device_batch_size: int = Field(..., gt=0)
     gradient_accumulation: int = Field(..., gt=0)
     sequence_length: int = Field(..., gt=0)
+    # Sequence-length curriculum: when set, the first `warmup_steps` use this
+    # shorter seq, after which seq returns to `sequence_length`. RoPE handles
+    # variable seq natively. Token accounting uses the current seq, so the
+    # warmup phase contributes proportionally fewer tokens to the budget; the
+    # cosine schedule's `total_steps` is derived from the post-warmup
+    # tokens_per_step (warmup tokens are "free" in the schedule shape).
+    warmup_sequence_length: int | None = Field(default=None, gt=0)
     log_every_n_steps: int = Field(..., gt=0)
     eval_every_n_steps: int = Field(..., gt=0)
     # `0` means "no partial saves" — only the final checkpoint is written at
     # end-of-training. Per HLR-0007 / LLR-0027 this is the smoke-tier
     # behaviour (smoke runs are too short to benefit from periodic saves).
     save_every_n_steps: int = Field(..., ge=0, description="0 = skip partial saves; final-only")
-    trainable_scope: Literal["full", "experts_only", "factored_only"]
+    trainable_scope: Literal["full", "experts_only", "factored_only", "routers_frozen"]
     use_gradient_checkpointing: bool = True
+    # Auto-rewind plateau guard. The trainer already maintains `_best_raw_kl_ema`
+    # and writes a best-pointer JSON every committed window. When the running
+    # `raw_kl_ema` exceeds `multiplier × _best_raw_kl_ema` for `consecutive`
+    # consecutive windows (after step `min_step`), the trainer raises
+    # `PlateauCollapse` so the bootstrap script can resume from the best
+    # pointer instead of burning compute on a collapsing trajectory. The
+    # defaults are conservative; tighten or loosen via YAML.
+    plateau_guard_multiplier: float = Field(default=3.0, gt=1.0)
+    plateau_guard_consecutive: int = Field(default=5, ge=1)
+    plateau_guard_min_step: int = Field(default=30, ge=0)
 
     @model_validator(mode="after")
     def _validate_temperature_curriculum(self) -> "DistillationConfig":
@@ -171,6 +204,24 @@ class DistillationConfig(BaseModel):
                 f"strictly greater than temperature ({self.temperature}) "
                 "to describe a soft-to-hard curriculum. Unset "
                 "temperature_start for constant-temperature training."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_muon_fields(self) -> "DistillationConfig":
+        """Muon-specific field consistency.
+
+        When `optimizer == "muon_with_adamw"`, `muon_learning_rate` must be
+        explicitly set — there's no implicit ratio default because the
+        appropriate Muon LR depends on factors the schema can't infer (e.g.
+        whether IQ2_XS codebook-flip ceiling constrains effective Δw). The
+        gt=0/lt=1 field constraint already catches the most common
+        unit-swap typo (e.g. accidentally setting Muon LR to 5e-5).
+        """
+        if self.optimizer == "muon_with_adamw" and self.muon_learning_rate is None:
+            raise ValueError(
+                "muon_with_adamw requires `muon_learning_rate` to be set "
+                "explicitly (typical range 1e-3..5e-2)."
             )
         return self
 

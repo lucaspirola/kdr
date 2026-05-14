@@ -25,18 +25,33 @@ from kdr.adapters.zaya1_8b import Zaya1Adapter
 from kdr.config import StudentConfig, TeacherConfig
 
 
-def test_required_attn_da_qad_is_eager() -> None:
-    """LLR-0026: da_qad must return eager so KV-quant hooks see post-
-    projection K/V tensors (CCA layer is wired only under eager in the
-    Zyphra fork)."""
+def test_required_attn_da_qad_student_is_eager() -> None:
+    """LLR-0026: da_qad student must return eager so KV-quant hooks see
+    post-projection K/V tensors (CCA layer is wired only under eager in the
+    Zyphra fork). Default role is student so the bare call still returns
+    eager — preserves the original contract."""
     assert Zaya1Adapter().required_attn_implementation("da_qad") == "eager"
+    assert (
+        Zaya1Adapter().required_attn_implementation("da_qad", role="student")
+        == "eager"
+    )
 
 
-def test_required_attn_bf16_is_sdpa() -> None:
-    """LLR-0026: BF16 must return sdpa — no hooks are placed in pure-BF16
-    distillation (NoOpReplayContextManager), so the eager-only constraint
-    does not apply and SDPA is ~2-3× faster on Hopper/Blackwell."""
-    assert Zaya1Adapter().required_attn_implementation("bf16") == "sdpa"
+def test_required_attn_da_qad_teacher_is_sdpa() -> None:
+    """LLR-0026 (Phase 7.2 split): da_qad teacher has no KV hooks, so SDPA
+    is allowed for ~2× teacher-forward throughput."""
+    assert (
+        Zaya1Adapter().required_attn_implementation("da_qad", role="teacher")
+        == "sdpa"
+    )
+
+
+def test_required_attn_bf16_is_sdpa_both_roles() -> None:
+    """LLR-0026: BF16 has no hooks in either role; both return sdpa."""
+    adapter = Zaya1Adapter()
+    assert adapter.required_attn_implementation("bf16") == "sdpa"
+    assert adapter.required_attn_implementation("bf16", role="teacher") == "sdpa"
+    assert adapter.required_attn_implementation("bf16", role="student") == "sdpa"
 
 
 def test_required_attn_rejects_unknown_mode() -> None:
@@ -65,24 +80,23 @@ def test_required_attn_returns_only_allowed_values() -> None:
 
 
 @pytest.mark.parametrize(
-    ("mode", "expected_attn"),
-    [("bf16", "sdpa"), ("da_qad", "eager")],
+    ("mode", "expected_teacher_attn", "expected_student_attn"),
+    [
+        ("bf16", "sdpa", "sdpa"),
+        # Phase 7.2: teacher has no KV hooks; only the student needs eager.
+        ("da_qad", "sdpa", "eager"),
+    ],
 )
 def test_load_teacher_and_student_threads_mode_into_loaders(
-    mode: str, expected_attn: str
+    mode: str, expected_teacher_attn: str, expected_student_attn: str
 ) -> None:
-    """LLR-0026 AC #4: `load_teacher_and_student(mode=mode)` MUST thread the
-    mode into `required_attn_implementation(mode)` AND pass the resulting
-    attn_implementation into both teacher and student `_load_one` calls.
+    """LLR-0026 AC #4 (Phase 7.2): `load_teacher_and_student(mode=mode)` MUST
+    thread the mode into `required_attn_implementation(mode, role=...)` for
+    each model separately. Teacher (no KV hooks) and student (KV-quant
+    hooks) may receive different `attn_implementation` values.
 
     No GPU / no HF download needed — `_load_one` is patched to a MagicMock,
-    and we verify the call kwargs. This closes the threading gap that the
-    GPU-only Phase 7 validation would otherwise be the only check on.
-
-    If a future refactor accidentally bypasses `required_attn_implementation`
-    (e.g., hard-codes attn_implementation at the call site, drops the mode
-    kwarg, or wires teacher-only / student-only correctly), this test fails
-    BEFORE the GPU run.
+    and we verify the call kwargs.
     """
     adapter = Zaya1Adapter()
     teacher_cfg = TeacherConfig(
@@ -126,17 +140,19 @@ def test_load_teacher_and_student_threads_mode_into_loaders(
     assert student is fake_student
     assert tokenizer is fake_tokenizer
 
-    # Both `_load_one` calls must have received `attn_implementation=expected_attn`
-    # (mode-aware: eager for da_qad, sdpa for bf16). Verifies the adapter
-    # overrode the YAML's `sdpa` value when the mode requires eager.
+    # First call is teacher (LLR-0023 load order); second is student.
     assert mock_load_one.call_count == 2, "expected one _load_one per model"
-    for call in mock_load_one.call_args_list:
-        assert call.kwargs["attn_implementation"] == expected_attn, (
-            f"_load_one called with attn_implementation="
-            f"{call.kwargs['attn_implementation']!r}, expected "
-            f"{expected_attn!r} for mode={mode!r}."
-        )
-    # And the first call's role must be TEACHER, second STUDENT — the
-    # adapter docstring guarantees this order (LLR-0023).
-    assert mock_load_one.call_args_list[0].kwargs["role"] == "TEACHER"
-    assert mock_load_one.call_args_list[1].kwargs["role"] == "STUDENT"
+    teacher_call = mock_load_one.call_args_list[0]
+    student_call = mock_load_one.call_args_list[1]
+    assert teacher_call.kwargs["role"] == "TEACHER"
+    assert student_call.kwargs["role"] == "STUDENT"
+    assert teacher_call.kwargs["attn_implementation"] == expected_teacher_attn, (
+        f"teacher _load_one attn_implementation="
+        f"{teacher_call.kwargs['attn_implementation']!r}, expected "
+        f"{expected_teacher_attn!r} for mode={mode!r}."
+    )
+    assert student_call.kwargs["attn_implementation"] == expected_student_attn, (
+        f"student _load_one attn_implementation="
+        f"{student_call.kwargs['attn_implementation']!r}, expected "
+        f"{expected_student_attn!r} for mode={mode!r}."
+    )

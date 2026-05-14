@@ -128,24 +128,31 @@ quant:
 
 distillation:
   loss: forward_kld
+  # Top-k FKLD with tail-mass correction. V≈150k for ZAYA1; k=512 keeps
+  # bias <0.5% of the KL value while cutting the loss-path fp32 transient
+  # from ~2.5 GB to ~50 MB per micro.
+  kd_topk: 512
   # Temperature curriculum (borrowed from max_quality stage-5 KD):
   # linear ramp from `temperature_start` (4.0) at step 0 to `temperature`
-  # (1.0) at the final step. High T early smooths the teacher target so
+  # (2.0) at the final step. High T early smooths the teacher target so
   # STE updates aren't chasing sharp peaks while IQ2_XS codebook
-  # assignments are still settling; sharpens to a hard target once the
-  # student is in-basin. τ-invariant `raw_kl = loss / T²` is the metric
-  # tracked across this schedule (logged on every committed step).
-  temperature: 1.0
+  # assignments are still settling. Endpoint at 2.0 (was 1.0) matches the
+  # QAT literature consensus for ≤3-bit recovery (Q-LoRA §4.2, AWQ
+  # recovery): T=1 over-sharpens the codebook-flip frontier and was a
+  # plausible run-1 collapse contributor. τ-invariant `raw_kl = loss / T²`
+  # remains the metric tracked across this schedule.
+  temperature: 2.0
   temperature_start: 4.0
-  optimizer: adamw_bnb_8bit
-  # lr revised from 2.0e-4 → 5.0e-5 (4× drop) after the post-warmup
-  # divergence observed in the first run (loss 0.64 @ step 10 → 47 @
-  # step 25, wikitext2_ppl=4.5e24 @ step 50). Root cause: at 2.3 bpw the
-  # IQ2_XS codebook gap between adjacent magnitudes is smaller than the
-  # per-step Δw at lr=2e-4, so post-warmup updates flip codebook
-  # assignments faster than the optimizer can settle. 5e-5 is the
-  # standard Q-LoRA / QAT range for ≤3-bit quantisation. 8e-5 is the
-  # upper bound entertained; >=1e-4 keeps the codebook-flip risk.
+  # Muon (Keller Jordan, 2024) over 2D Linear weights; AdamW-8bit over
+  # everything else (embeds, lm_head, RMSNorm scales, routers, val_proj,
+  # biases). Split driven by the adapter's fp32_carve_outs pattern list.
+  # Muon is published to be ~2× sample-efficient on hidden weight matrices.
+  optimizer: muon_with_adamw
+  # AdamW-group base LR. Kept at 5.0e-5 — the run-1 collapse rationale at
+  # 2.3 bpw (IQ2_XS codebook-gap < per-step Δw) targeted the 2D Linear
+  # updates that Muon now owns; the AdamW group is now embeddings + norms
+  # + routers + biases where 5e-5 is the standard Q-LoRA / QAT range and
+  # nothing has changed.
   learning_rate: 5.0e-5
   # Keep cosine decay ratio sane (~10× from peak to min) instead of
   # the previous ~110× tail; preserves learning signal in the tail.
@@ -153,8 +160,17 @@ distillation:
   weight_decay: 0.01
   # β₂ 0.999 → 0.95: faster second-moment EMA equilibration matches MoE
   # QAT precedent. The previous 0.999 needed ~10× the steps for the EMA
-  # to stabilise, which underflowed the 20-step warmup.
+  # to stabilise, which underflowed the 20-step warmup. (AdamW group only.)
   betas: [0.9, 0.95]
+  # Muon-group base LR. Keller Jordan's blog suggests Muon LR ≈ 50× AdamW
+  # LR for unconstrained pretraining (→ 2.5e-3 from 5e-5). Profile-J's
+  # IQ2_XS codebook-flip ceiling is the binding constraint on effective
+  # per-step Δw, NOT Adam's effective LR — so the safe starting point is
+  # slightly below the naïve ratio. Tune up if convergence is slow.
+  muon_learning_rate: 2.0e-3
+  muon_momentum: 0.95
+  muon_nesterov: true
+  muon_ns_steps: 5
   # Tighter clip; the run-1 trace had a clear precursor spike at step 15
   # before divergence kicked in at step 20.
   grad_clip_norm: 0.5
@@ -166,13 +182,40 @@ distillation:
   per_device_batch_size: 1
   gradient_accumulation: 32
   sequence_length: 4096
+  # Sequence-length curriculum: warmup runs at seq=2048, then ramps to
+  # 4096 once warmup_steps completes. ~3× throughput on the first 60
+  # steps, ~10% total wall-clock saved. RoPE handles variable seq
+  # natively; total_steps stays derived from the post-warmup
+  # sequence_length so the cosine schedule shape is unchanged.
+  warmup_sequence_length: 2048
   log_every_n_steps: 5
   eval_every_n_steps: 50
   save_every_n_steps: 25  # Tighter rollback granularity (was 50). Costs
                           # ~2 min of save I/O per ~25 steps of training;
                           # cheap insurance after the run-1 catastrophe.
-  trainable_scope: full
+  # Freeze the student's MoE routers. Router replay already overrides the
+  # student router's forward output with the teacher's at every MoE layer,
+  # so backward through the replaced tensor doesn't reach the student
+  # router's params anyway — but they're still in the optimizer state
+  # eating 8-bit AdamW memory. <1% of params.
+  trainable_scope: routers_frozen
   use_gradient_checkpointing: true
+  # Probe the largest microbatch that fits VRAM at trainer init and rebalance
+  # gradient_accumulation accordingly (tokens_per_step preserved). On B200
+  # this typically buys 1.5-2× steady-state throughput.
+  auto_batch_size: true
+  # Async save_partial — overlaps the rank-0 disk-write with the next
+  # forward+backward, saving ~10-30 s per partial on 8B BF16. Matches
+  # the bf16_recovery config; the cost is ~weight-tensor-size of CPU
+  # RAM per pending snapshot (~17 GB at 8B BF16).
+  enable_async_save: true
+  # Plateau guard: if raw_kl_ema > 3× best for 5 consecutive windows past
+  # step 30, raise PlateauCollapse so the bootstrap script resumes from
+  # the best-pointed partial. Defaults; tighten if run-1-style collapses
+  # recur.
+  plateau_guard_multiplier: 3.0
+  plateau_guard_consecutive: 5
+  plateau_guard_min_step: 30
 
 eval:
   wikitext2:

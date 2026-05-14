@@ -212,17 +212,21 @@ def test_derive_run_id_cross_machine_golden() -> None:
     in-flight runs against the prior hash are losing their resume seeds.
     """
     rid = derive_run_id(_config(), "a" * 40, "bf16")
-    # Golden rotated twice by the Phase 7+ throughput optimization:
+    # Golden rotated by each schema addition (LLR-0031: any config field
+    # change must surface as a new run_id so partials don't get silently
+    # cross-loaded between incompatible configs):
     #   - Phase B added `DistillationConfig.auto_batch_size` →
     #     `0842bde6e350eb3b` → `d2d17acb1ea3bfc3`.
     #   - Phase C added `DistillationConfig.enable_async_save` →
     #     `d2d17acb1ea3bfc3` → `94261061b2d9bda0`.
-    # Each schema addition rotates the run_id by design (LLR-0031: any
-    # config field change must surface as a new run_id so partials don't
-    # get silently cross-loaded between incompatible configs). Verified:
-    # no in-flight vast.ai runs against the prior hashes (Phase 7.1 smoke
-    # completed and destroyed before these changes).
-    assert rid == "94261061b2d9bda0", (
+    #   - Phase 7.2 (Run-2 bundle) added `kd_topk`, `muon_*` fields,
+    #     `adamw_group_learning_rate`, `warmup_sequence_length`, and
+    #     `plateau_guard_*` fields; literals on `optimizer` and
+    #     `trainable_scope` were extended. Result:
+    #     `94261061b2d9bda0` → `439661d1048150ea`.
+    # Verified: no in-flight vast.ai runs against the prior hashes
+    # (Phase 7.1 smoke completed, Run-1 collapsed and destroyed).
+    assert rid == "439661d1048150ea", (
         f"run_id drift detected — got {rid!r}. If intentional (Config "
         "schema change), update this golden value AND verify no in-flight "
         "vast.ai runs against the prior hash will lose their partials."

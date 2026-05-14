@@ -115,20 +115,28 @@ class ModelAdapter(Protocol):
         """
         ...
 
-    def required_attn_implementation(self, mode: Mode) -> Literal["eager", "sdpa"]:
+    def required_attn_implementation(
+        self,
+        mode: Mode,
+        *,
+        role: Literal["teacher", "student"] = "student",
+    ) -> Literal["eager", "sdpa"]:
         """The HF `attn_implementation` value the adapter requires for `mode`.
 
-        Mode-aware (LLR-0026):
+        Mode + role-aware (LLR-0026). The eager-only constraint in da_qad
+        applies to the **student** (KV-quant hooks); the **teacher** has no
+        hooks installed and can always use SDPA.
 
-        - `mode == 'da_qad'` → return the backend whose K/V tensors are
-          exposed at a Python hook boundary (typically `'eager'`). The
-          KV-quant simulator's forward hooks intercept post-projection K/V
-          tensors at every attention layer; SDPA and flash-attn fuse the
-          K/V projection differently and bypass the hook.
-        - `mode == 'bf16'` → return the fastest backend that produces
-          numerically equivalent output (typically `'sdpa'`). No hooks are
-          placed in pure-BF16 distillation, so the eager-only constraint
-          does not apply.
+        - `mode == 'da_qad', role == 'student'` → return the backend whose
+          K/V tensors are exposed at a Python hook boundary (typically
+          `'eager'`). The KV-quant simulator's forward hooks intercept
+          post-projection K/V tensors at every attention layer; SDPA and
+          flash-attn fuse the K/V projection differently and bypass the hook.
+        - `mode == 'da_qad', role == 'teacher'` → return `'sdpa'`. The
+          teacher has no KV hooks, so eager is unnecessary and ~2× slower.
+        - `mode == 'bf16'` (either role) → return the fastest backend that
+          produces numerically equivalent output (typically `'sdpa'`). No
+          hooks are placed in pure-BF16 distillation.
 
         Flash-attn is rejected in both modes because it fuses K/V projection
         and never exposes post-projection K/V tensors at a Python hook

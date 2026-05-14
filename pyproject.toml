@@ -109,6 +109,9 @@ ignore = ["E501"]  # line length: handled by formatter
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["B011"]  # asserting False is fine in tests
+# Vendored Muon: Newton-Schulz iteration uses math-notation single-letter
+# identifiers (G, X, A, B). Exempt the pep8-naming rule on this file only.
+"src/kdr/training/_muon.py" = ["N803", "N806"]
 
 # ──────────────────────────────────────────────────────────────────────────────
 # pytest

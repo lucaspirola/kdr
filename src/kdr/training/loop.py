@@ -52,7 +52,7 @@ from ..io.save import (
 )
 from ..kd_loss import forward_kld_loss
 from ..quant.interface import QuantBackend
-from .optim import build_optimizer, cosine_with_warmup, set_lr
+from .optim import ChainedOptimizer, build_optimizer, cosine_with_warmup, set_lr
 from .zero3_init import activate_zero3_init, is_deepspeed
 
 log = logging.getLogger(__name__)
@@ -149,7 +149,29 @@ def run_recovery(
 
     # ── Stage 2: trainable scope + optimizer + accelerator.prepare ────────
     _enable_trainable_scope(student, scope=config.distillation.trainable_scope)
-    optim = build_optimizer(student, config.distillation)
+    # `muon_with_adamw` needs the adapter's carve-out patterns to split
+    # 2D Linear weights (Muon group) from embeds/norms/routers/val_proj/biases
+    # (AdamW group). Compute the patterns even in bf16 mode so the split has
+    # the same semantics regardless of quant; the patterns are pure naming
+    # rules with no model mutation.
+    optim_carve_outs: list[str] | None = None
+    if config.distillation.optimizer == "muon_with_adamw":
+        if is_deepspeed(accelerator):
+            raise RuntimeError(
+                "muon_with_adamw is incompatible with DeepSpeed ZeRO-3: the "
+                "duck-typed ChainedOptimizer wrapper is not a "
+                "torch.optim.Optimizer subclass, so DS's optimizer wrap "
+                "would reject it. Pick adamw_bnb_8bit or deepspeed_cpu_adam "
+                "for ZeRO-3 paths."
+            )
+        optim_carve_outs = (
+            cached_fp32_carve_outs
+            if cached_fp32_carve_outs
+            else adapter.fp32_carve_outs(student)
+        )
+    optim = build_optimizer(
+        student, config.distillation, carve_out_patterns=optim_carve_outs
+    )
     student, optim = accelerator.prepare(student, optim)
 
     # ── Stage 3: place the teacher correctly for the chosen distributed type
@@ -187,6 +209,7 @@ def run_recovery(
             max_bs_cap=max_bs_cap,
             accelerator=accelerator,
             temperature=config.distillation.temperature,
+            kd_topk=config.distillation.kd_topk,
         )
         new_ga = max_bs_cap // probed_bs
         if probed_bs != original_bs or new_ga != original_ga:
@@ -319,6 +342,7 @@ def _probe_max_batch_size(
     max_bs_cap: int,
     accelerator: Accelerator,
     temperature: float,
+    kd_topk: int | None = None,
     vram_budget_fraction: float = 0.85,
 ) -> int:
     """Probe the largest `per_device_batch_size` that fits VRAM, capped at
@@ -428,7 +452,9 @@ def _probe_max_batch_size(
             with torch.no_grad():
                 t_out = teacher(input_ids=input_ids, use_cache=False).logits
             s_out = student(input_ids=input_ids, use_cache=False).logits
-            loss = forward_kld_loss(s_out, t_out, temperature=temperature)
+            loss = forward_kld_loss(
+                s_out, t_out, temperature=temperature, kd_topk=kd_topk
+            )
             loss.backward()  # type: ignore[no-untyped-call]
 
             if device.type == "cuda":
@@ -492,23 +518,75 @@ def _probe_max_batch_size(
 
 
 def _enable_trainable_scope(student: nn.Module, *, scope: str) -> int:
-    """v0 supports only `scope="full"`. The `experts_only` and
-    `factored_only` scopes from structural_recovery require
-    `moe_compress.utils.iter_moe_layers` which is not a kdr dependency;
-    Phase 5+ may reintroduce those if needed."""
-    if scope != "full":
-        raise NotImplementedError(
-            f"trainable_scope={scope!r} is not implemented in kdr v0. "
-            "Only 'full' is supported (the experts_only/factored_only "
-            "scopes from structural_recovery require moe_compress.utils "
-            "which kdr does not depend on)."
+    """Set `requires_grad` on `student`'s parameters per `scope`.
+
+    Supported scopes:
+      * `"full"` — every parameter is trainable.
+      * `"routers_frozen"` — every parameter is trainable EXCEPT those
+        whose dotted name contains `"router"`. Pairs with router-replay
+        (`adapters/router_replay.py`): the student router's forward output
+        is overridden with the teacher's at every MoE layer, so backward
+        through the replaced tensor doesn't reach the student router's
+        params anyway. Keeping them in the optimizer wastes 8-bit AdamW
+        state and adds drift; freezing is a no-op on the gradient signal
+        but cleans up the optimizer footprint.
+
+    `"experts_only"` and `"factored_only"` (from structural_recovery)
+    require `moe_compress.utils.iter_moe_layers` which is not a kdr
+    dependency; Phase 5+ may reintroduce those if needed.
+    """
+    if scope == "full":
+        n_trainable = 0
+        for p in student.parameters():
+            p.requires_grad_(True)
+            n_trainable += p.numel()
+        log.info(
+            "trainable_scope=full -> %.3fB params trainable", n_trainable / 1e9
         )
-    n_trainable = 0
-    for p in student.parameters():
-        p.requires_grad_(True)
-        n_trainable += p.numel()
-    log.info("trainable_scope=%s -> %.3fB params trainable", scope, n_trainable / 1e9)
-    return n_trainable
+        return n_trainable
+
+    if scope == "routers_frozen":
+        n_trainable = 0
+        n_frozen = 0
+        for name, p in student.named_parameters():
+            if "router" in name:
+                p.requires_grad_(False)
+                n_frozen += p.numel()
+            else:
+                p.requires_grad_(True)
+                n_trainable += p.numel()
+        log.info(
+            "trainable_scope=routers_frozen -> %.3fB trainable, %.3fM frozen",
+            n_trainable / 1e9,
+            n_frozen / 1e6,
+        )
+        return n_trainable
+
+    raise NotImplementedError(
+        f"trainable_scope={scope!r} is not implemented in kdr v0. "
+        "Supported: 'full', 'routers_frozen'."
+    )
+
+
+class PlateauCollapseError(Exception):
+    """Raised by the trainer when `raw_kl_ema` exceeds the plateau threshold.
+
+    The bootstrap script catches this exception and resumes from the
+    best-pointed partial (see `kdr/io/resume.py:find_latest_partial`). The
+    exception carries the offending step + EMA values for telemetry.
+    """
+
+    def __init__(
+        self, *, step: int, ema: float, best: float, best_step: int
+    ) -> None:
+        super().__init__(
+            f"plateau collapse at step={step}: raw_kl_ema={ema:.4f} "
+            f"exceeds threshold (best={best:.4f} at step={best_step})"
+        )
+        self.step = step
+        self.ema = ema
+        self.best = best
+        self.best_step = best_step
 
 
 # ---------------------------------------------------------------------------
@@ -616,6 +694,12 @@ class _LoopState:
         self._best_raw_kl_ema: float | None = None
         self._best_step: int = 0
         self._best_metadata: dict[str, Any] = {}
+        # Plateau guard: count consecutive windows where `raw_kl_ema` exceeds
+        # `plateau_guard_multiplier × _best_raw_kl_ema`. After
+        # `plateau_guard_consecutive` strikes (and beyond step
+        # `plateau_guard_min_step`), `_commit_window` raises `PlateauCollapse`
+        # so the bootstrap script resumes from the best-pointed partial.
+        self._plateau_strikes: int = 0
 
         # Observability knobs (env-tunable so YAML edits aren't required).
         # KDR_MICRO_HEARTBEAT=N    -> emit a heartbeat log every N micro-batches
@@ -626,6 +710,14 @@ class _LoopState:
         self._micro_heartbeat_every = int(os.environ.get("KDR_MICRO_HEARTBEAT", "4") or "0")
         self._micro_heartbeat_t0 = time.monotonic()
         self._step_t0 = time.monotonic()
+
+    @property
+    def _is_multi_group(self) -> bool:
+        # `muon_with_adamw` (and any other ChainedOptimizer variant) uses two
+        # param groups with different base LRs; `set_lr` needs an `lr_max_ref`
+        # to preserve the absolute ratio while sharing the cosine *shape*.
+        # Single-group optimizers return False.
+        return isinstance(self.optim, ChainedOptimizer)
 
     # REQ: LLR-0043
     def run(self) -> None:
@@ -730,6 +822,27 @@ class _LoopState:
     def _step_one_micro(self, batch: torch.Tensor) -> None:
         """Forward teacher+student, compute loss, accumulate / step."""
         ids = batch.to(self.accelerator.device, non_blocking=True)
+        # Sequence-length curriculum: during the first `warmup_steps`, slice
+        # the batch down to `warmup_sequence_length` if configured. RoPE
+        # handles variable seq natively; the token-accounting block below
+        # uses `ids.numel()` which reflects the slice. `total_steps` is
+        # computed against the post-warmup `sequence_length` so the cosine
+        # schedule's shape is unaffected — warmup tokens are "free."
+        if (
+            self.dconf.warmup_sequence_length is not None
+            and self.step < self.warmup
+            and ids.shape[-1] > self.dconf.warmup_sequence_length
+        ):
+            ids = ids[:, : self.dconf.warmup_sequence_length].contiguous()
+        elif (
+            self.dconf.warmup_sequence_length is not None
+            and self.step < self.warmup
+        ):
+            log.debug(
+                "warmup_sequence_length=%d but batch already at T=%d; no slice applied",
+                self.dconf.warmup_sequence_length,
+                ids.shape[-1],
+            )
         # REQ: LLR-0025
         # Reset router-replay state at the top of every microbatch so the
         # teacher's freshly-captured assignments drive THIS microbatch's
@@ -751,7 +864,12 @@ class _LoopState:
         # heartbeat / step-log paths can read the same value that produced
         # the most recent loss.
         self._last_temperature = self._current_temperature()
-        loss = forward_kld_loss(s_logits, t_logits, temperature=self._last_temperature)
+        loss = forward_kld_loss(
+            s_logits,
+            t_logits,
+            temperature=self._last_temperature,
+            kd_topk=self.dconf.kd_topk,
+        )
 
         this_micro_tokens = int(ids.numel()) * self.world
         self.tokens_consumed += this_micro_tokens
@@ -838,6 +956,9 @@ class _LoopState:
                 lr_max=self.lr_max,
                 lr_min=self.lr_min,
             ),
+            # Multi-group: preserve absolute base-LR ratios (Muon vs AdamW)
+            # while sharing the cosine *shape*. Single-group: stays bit-identical.
+            lr_max_ref=self.lr_max if self._is_multi_group else None,
         )
         self.optim.step()
         self.optim.zero_grad(set_to_none=True)
@@ -925,6 +1046,51 @@ class _LoopState:
                         "loss": loss_val_for_ema,
                     }
 
+                # Plateau guard: count consecutive windows where the EMA
+                # exceeds `multiplier × best`. After `consecutive` strikes
+                # (past `min_step`), raise `PlateauCollapse` so the
+                # bootstrap script resumes from the best-pointed partial.
+                # The check runs only when we have a best baseline and are
+                # past the burn-in window — early-warmup EMAs would
+                # otherwise trip the guard before the run has a chance to
+                # settle.
+                if (
+                    self.step >= self.dconf.plateau_guard_min_step
+                    and self._best_raw_kl_ema is not None
+                    and self._best_raw_kl_ema > 0
+                    and self._raw_kl_ema is not None
+                    and self._raw_kl_ema
+                    > self.dconf.plateau_guard_multiplier
+                    * self._best_raw_kl_ema
+                ):
+                    self._plateau_strikes += 1
+                else:
+                    self._plateau_strikes = 0
+                if (
+                    self._plateau_strikes
+                    >= self.dconf.plateau_guard_consecutive
+                ):
+                    # Narrow the Optional types for mypy — both are guaranteed
+                    # non-None by the strike-counting branch above.
+                    assert self._raw_kl_ema is not None
+                    assert self._best_raw_kl_ema is not None
+                    log.error(
+                        "plateau collapse: %d consecutive windows with "
+                        "raw_kl_ema (%.4f) > %.1fx best (%.4f at step %d); "
+                        "raising PlateauCollapseError for resume.",
+                        self._plateau_strikes,
+                        self._raw_kl_ema,
+                        self.dconf.plateau_guard_multiplier,
+                        self._best_raw_kl_ema,
+                        self._best_step,
+                    )
+                    raise PlateauCollapseError(
+                        step=self.step,
+                        ema=float(self._raw_kl_ema),
+                        best=float(self._best_raw_kl_ema),
+                        best_step=self._best_step,
+                    )
+
         if self.accelerator.is_main_process and (
             self.step == 1
             or self.step % self.dconf.log_every_n_steps == 0
@@ -971,6 +1137,17 @@ class _LoopState:
                 self.tokens_skipped_nan / 1e6,
                 step_dt,
             )
+            if self._is_multi_group:
+                # `param_groups[0]` is Muon (logged above as `lr=`);
+                # `param_groups[-1]` is the AdamW group. Surface both so
+                # the cosine ratio + base-LR ratio are both visible at
+                # every logged step.
+                log.info(
+                    "step=%d muon_lr=%.3e adamw_lr=%.3e",
+                    self.step,
+                    self.optim.param_groups[0]["lr"],
+                    self.optim.param_groups[-1]["lr"],
+                )
 
         # REQ: LLR-0049
         # Eval cadence: step > 0 AND step % eval_every_n_steps == 0.
