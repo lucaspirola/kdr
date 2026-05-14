@@ -1,10 +1,23 @@
 # kdr — Knowledge Distillation Recovery
 
-Unified Chapter-1 BF16 KD + Chapter-3 Deployment-Aware QAD trainer for the
-`moe_compress` pipeline. One mode flag, one FKLD loss, asymmetric K/V quant
-recipes, compressed-tensors output. See
-[`/home/lucas/.claude/plans/radiant-pondering-beacon.md`](../../../.claude/plans/radiant-pondering-beacon.md)
-for the full architecture and `../requirements/` for the HLR/LLR set.
+Unified BF16 KD + Deployment-Aware QAD trainer for MoE-LLM recovery after
+aggressive weight quantization. One mode flag, one FKLD loss, asymmetric K/V
+quant recipes, compressed-tensors output. See [`requirements/`](requirements/)
+for the HLR/LLR set and [`docs/PROFILEJ_STRATEGY.md`](docs/PROFILEJ_STRATEGY.md)
+for the recipe rationale.
+
+## Quick start
+
+```bash
+# Local dev (CPU/single-GPU smoke):
+uv sync
+uv run pytest tests/
+
+# vast.ai / RunPod training: see docker/README.md.
+# The image at ghcr.io/lucaspirola/kdr:latest runs docker/bootstrap.sh as
+# ENTRYPOINT; pass env vars HF_TOKEN, STUDENT_REPO, CACHE_MOUNT, KDR_CONFIG,
+# KDR_MODE per docker/README.md.
+```
 
 ## Status
 
