@@ -86,7 +86,11 @@ it expects:
 ```bash
 git clone https://github.com/lucaspirola/kdr.git && cd kdr
 bash docker/host_setup.sh      # ~15-25 min: deps + source-compiled kernels
-bash docker/bootstrap.sh       # with the required env vars exported
+# Export the env the kdr image bakes in as Dockerfile ENV, then the
+# required job vars (see "Required env vars" above):
+export PIP_BREAK_SYSTEM_PACKAGES=1 PYTHONUNBUFFERED=1
+export PYTORCH_ALLOC_CONF=expandable_segments:True   # near-OOM runs need this
+bash docker/bootstrap.sh
 ```
 
 Do NOT hand-roll the dependency install — `host_setup.sh` is the tested

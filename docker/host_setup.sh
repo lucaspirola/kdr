@@ -43,6 +43,9 @@ echo ">>> [1/5] apt build prerequisites"
 apt-get update -qq
 apt-get install -y -qq --no-install-recommends \
     python3 python3-dev git curl ca-certificates build-essential ninja-build
+# bootstrap.sh invokes the bare `python` command; the CUDA base image only
+# ships `python3`. The Dockerfile creates this symlink — mirror it here.
+ln -sf /usr/bin/python3 /usr/bin/python
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. pip — Ubuntu 24.04 base images ship Python without pip.
