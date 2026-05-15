@@ -81,6 +81,27 @@ def test_wikitext2_ppl_returns_finite_float_on_tiny_model() -> None:
 
 
 # REQ: VERIFIES: LLR-0036
+def test_wikitext2_ppl_raises_on_partial_corpus() -> None:
+    """A corpus too small for the requested sequence count must raise — a PPL
+    over fewer sequences than configured is not comparable to a full-corpus
+    PPL, so the eval refuses to report a misleading number. `run()` catches
+    the ValueError and returns None (verified separately)."""
+    from kdr.eval.quick import wikitext2_ppl
+
+    accel = _fake_accelerator()
+    student = _TinyLM(vocab=17)
+    # 40 tokens at seq_len=8 -> only 5 full sequences available; request 20.
+    tok = MagicMock()
+    tok.return_value = {"input_ids": list(range(8)) * 5}
+    tok.eos_token_id = 7
+    cfg = WikiText2Config(enabled=True, sequence_length=8, num_sequences=20)
+
+    with patch("datasets.load_dataset", return_value=_fake_dataset()):
+        with pytest.raises(ValueError, match="partial-corpus PPL"):
+            wikitext2_ppl(student, tok, cfg, accel)
+
+
+# REQ: VERIFIES: LLR-0036
 def test_wikitext2_ppl_does_not_construct_distributed_sampler() -> None:
     """Collective forward — no DistributedSampler. We can't simulate world>1
     in a unit test, but we can verify the function doesn't *construct* one

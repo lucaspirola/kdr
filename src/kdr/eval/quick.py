@@ -97,19 +97,18 @@ def wikitext2_ppl(
 
     encoded = tokenizer(text, add_special_tokens=False, return_tensors=None)
     ids_list = encoded["input_ids"]
-    # Clamp to what the corpus actually provides — never EOS-pad beyond the
-    # real text, which biases PPL low.
-    available = max(1, len(ids_list) // seq_len)
-    n_seqs = min(n_seqs_req, available)
-    # REQ: LLR-0038
-    if n_seqs < n_seqs_req and accelerator.is_main_process:
-        log.info(
-            "eval :: WikiText-2 only fits %d full sequences of %d tokens "
-            "(requested %d) — clamping.",
-            n_seqs,
-            seq_len,
-            n_seqs_req,
+    # Fail loud on a partial corpus: a PPL over fewer sequences than requested
+    # is not comparable to the full-corpus PPL, so refuse to report a
+    # misleading number. `run()` catches this, logs it, and returns None —
+    # eval is a diagnostic, never a gate.
+    available = len(ids_list) // seq_len
+    if available < n_seqs_req:
+        raise ValueError(
+            f"WikiText-2 test fits only {available} full sequences of "
+            f"{seq_len} tokens, but {n_seqs_req} were requested — refusing "
+            f"to report a partial-corpus PPL."
         )
+    n_seqs = n_seqs_req
 
     ids_list = ids_list[: n_seqs * seq_len]
     # REQ: LLR-0062
