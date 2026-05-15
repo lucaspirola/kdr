@@ -167,6 +167,28 @@ def classify_params(
     name_of: dict[int, str] = {}
     owner_of: dict[int, nn.Module] = {}
     attrname_of: dict[int, str] = {}
+    # Pre-pass: transparently follow `nn.utils.parametrize.register_parametrization`
+    # (used by NativeBackend's weight STE). After registration, the backing
+    # Parameter lives at `module.parametrizations.weight.original`, while
+    # `module.weight` becomes a recomputed Tensor (not a Parameter). A naive
+    # named_parameters walk buckets that Parameter under owner=ParametrizationList,
+    # attr='original' — which fails the Muon predicate below and silently
+    # pushes every quantized Linear into AdamW.
+    for mod_name, mod in student.named_modules():
+        if not isinstance(mod, nn.Linear):
+            continue
+        parametrizations = getattr(mod, "parametrizations", None)
+        wp = getattr(parametrizations, "weight", None) if parametrizations is not None else None
+        weight_param = wp.original if wp is not None else mod.weight
+        if not isinstance(weight_param, nn.Parameter) or not weight_param.requires_grad:
+            continue
+        key = id(weight_param)
+        if key in name_of:
+            continue
+        name_of[key] = f"{mod_name}.weight" if mod_name else "weight"
+        owner_of[key] = mod
+        attrname_of[key] = "weight"
+
     for mod_name, mod in student.named_modules():
         for attr, p in mod.named_parameters(recurse=False):
             if not p.requires_grad:
