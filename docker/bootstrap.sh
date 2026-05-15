@@ -144,16 +144,16 @@ if ! pip install --upgrade --force-reinstall --quiet \
     exit 3
 fi
 
-# Upgrade huggingface_hub to >=1.10 so the strict-dataclass validator
-# recognises PEP-604 union types (`str | None`). The image ships with
-# huggingface_hub 0.36.2, whose validator can't read the field annotations
-# in `kernels==0.14.0`'s deps.py; without this upgrade the trainer crashes
-# at adapter teacher-load with `StrictDataclassFieldValidationError` deep
-# inside the transformers→kernels import chain. The hf-hub minor versions
-# are backwards-compatible at the API surface kdr uses (snapshot_download,
-# whoami, list_repo_files); the upgrade is safe.
-if ! pip install --upgrade --quiet "huggingface_hub>=1.10.0"; then
-    echo "ERROR: huggingface_hub>=1.10.0 install failed." >&2
+# Pin huggingface_hub <1.0 to match the transformers 4.57.1 fork. hub 1.x
+# raises an uncaught RemoteEntryNotFoundError from list_repo_templates when a
+# recovered repo has no additional_chat_templates/ dir, failing the final
+# load-back round-trip (caught live in Phase 7.1, instance 36820220). The
+# fork install above should already resolve a <1.0 hub; this enforces it in
+# case a transitive dep or a stale image layer pulled hub 1.x.
+# (The old >=1.10 upgrade here existed only for `kernels`, a moe_compress
+# dep now dropped from docker/requirements.txt.)
+if ! pip install --quiet "huggingface_hub<1.0,>=0.34.0"; then
+    echo "ERROR: huggingface_hub<1.0 pin failed." >&2
     exit 3
 fi
 

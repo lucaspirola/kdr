@@ -1,29 +1,37 @@
-# Canonical dependency list for moe_compress (Strategy A pipeline).
+# Dependency list for the kdr portable GPU image.
 #
-# Single source of truth, mirrored by:
-#   - hf_jobs/entrypoint_ablations.py PEP 723 inline metadata (HF Jobs path)
-#   - docker/Dockerfile (vast.ai / external GPU path)
+# Consumed by docker/Dockerfile (`pip install -r docker/requirements.txt`).
+# docker/bootstrap.sh then force-reinstalls the Zyphra transformers fork
+# (lucaspirola/transformers@zaya1-patches, based on transformers 4.57.1) over
+# the version installed here — so the `transformers` pin below only needs to
+# resolve a hub-<1.0-compatible base, not match the fork exactly.
 #
-# Note: torch is installed separately (Dockerfile uses the cu128 wheel index;
-# the HF Jobs UV resolver picks an appropriate wheel automatically). We pin
-# the version range here for reference; the install command differs per path.
+# Note: torch is installed separately (Dockerfile uses the cu130 wheel index).
+# We pin the version range here for reference; the install command differs.
 
 # --- Deep learning core ---
 torch==2.11.0
-transformers>=5.8.0
+# Capped <5 so the image base stays compatible with huggingface_hub<1.0
+# (transformers 5.x requires hub 1.x). The Zyphra fork bootstrap.sh installs
+# is itself transformers 4.57.1-based.
+transformers>=4.57,<5
 accelerate>=1.0.0
 safetensors>=0.4.5
 tokenizers>=0.20.0
 sentencepiece>=0.2.0
 einops>=0.8.0
-# Required by transformers.integrations.finegrained_fp8 (block_size=128 FP8
-# quant) when loading Qwen3.6-35B-A3B-FP8 as the Stage 2.5 KD teacher.
-# Without this, the first forward pass through an FP8 linear layer raises
-# ImportError("finegrained-fp8 kernel requires the `kernels` package").
-kernels>=0.14.0
+# NOTE: `kernels` was a moe_compress dependency (the finegrained-fp8 path for
+# the Qwen FP8 KD teacher) and is intentionally NOT listed — kdr never imports
+# it, and it forces huggingface_hub>=1.10, which breaks transformers 4.57.1's
+# Hub round-trip: list_repo_templates 404s on a missing additional_chat_
+# templates/ dir under hub 1.x (caught live in Phase 7.1).
 
 # --- Hugging Face plumbing ---
-huggingface_hub>=0.26.0
+# Capped <1.0: transformers 4.57.1 requires huggingface-hub<1.0, and only
+# hub <1.0 raises the EntryNotFoundError that transformers catches when a
+# recovered repo lacks an additional_chat_templates/ dir. hub 1.x raises an
+# uncaught RemoteEntryNotFoundError -> load-back round-trip fails (Phase 7.1).
+huggingface_hub>=0.34,<1.0
 datasets>=3.0.0
 
 # --- Numerics + solvers ---
@@ -39,7 +47,8 @@ pydantic>=2.5.0     # config validation in kdr. kdr's bootstrap.sh runs
                     # so transitive runtime deps must be pre-installed here.
                     # See ../pyproject.toml for the same list.
 lm-eval>=0.4.5
-trackio>=0.5.0
+# NOTE: `trackio` removed — moe_compress experiment-tracking dep, never
+# imported by kdr, and it forces huggingface_hub>=1.10 (see hub pin above).
 nvidia-ml-py>=12.0
 psutil>=5.9
 bitsandbytes>=0.49.2
