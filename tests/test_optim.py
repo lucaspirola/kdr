@@ -209,6 +209,43 @@ def test_classify_params_skips_non_trainable() -> None:
     assert id(m.trainable.weight) in all_ids
 
 
+def test_classify_params_follows_ste_parametrized_linear() -> None:
+    """Regression: an STE-parametrized Linear weight still routes to Muon.
+
+    da_qad registers an `nn.utils.parametrize` parametrization on each
+    Linear `weight` before build_optimizer; the backing Parameter then
+    lives at `module.parametrizations.weight.original`, owned by a
+    ParametrizationList — not the nn.Linear. The Phase 7.2 crash was
+    classify_params missing that, classifying every quantized Linear into
+    AdamW and leaving the Muon group empty.
+    """
+    import torch.nn.utils.parametrize as P
+
+    class _FakeSTE(nn.Module):
+        # Returns a *new* tensor (as a real quant-STE parametrization does),
+        # so `module.weight` becomes a recomputed Tensor — not the backing
+        # Parameter passed straight through.
+        def forward(self, w: torch.Tensor) -> torch.Tensor:
+            return w + (w - w).detach()
+
+    class _Net(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.proj = nn.Linear(16, 16, bias=False)
+
+    m = _Net()
+    P.register_parametrization(m.proj, "weight", _FakeSTE())
+    backing = m.proj.parametrizations.weight.original
+    # After registration `proj.weight` is a recomputed Tensor, not a Parameter.
+    assert not isinstance(m.proj.weight, nn.Parameter)
+
+    muon, adamw = classify_params(m, carve_out_patterns=[])
+    assert id(backing) in {id(p) for p in muon}, (
+        "STE-parametrized Linear weight must classify into the Muon group"
+    )
+    assert id(backing) not in {id(p) for p in adamw}
+
+
 def test_build_optimizer_muon_requires_carve_outs() -> None:
     """muon_with_adamw without carve_out_patterns must error explicitly."""
     student = nn.Linear(8, 8)
