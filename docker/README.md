@@ -74,6 +74,24 @@ Or, equivalently, pre-bake the script into the launch command:
 "command": "bash /workspace/bootstrap.sh"
 ```
 
+### Bare-host path (no kdr image)
+
+If you are handed a clean instance running only a CUDA base image
+(`nvidia/cuda:13.0.x-cudnn-devel`) — no kdr image, no pip, no deps — run
+`docker/host_setup.sh` first. It reproduces the Dockerfile's environment
+build (apt prerequisites incl. `python3-dev`, pip, `wheel`, torch cu130,
+`requirements.txt`, compiled kernels) so `bootstrap.sh` has the environment
+it expects:
+
+```bash
+git clone https://github.com/lucaspirola/kdr.git && cd kdr
+bash docker/host_setup.sh      # ~15-25 min: deps + source-compiled kernels
+bash docker/bootstrap.sh       # with the required env vars exported
+```
+
+Do NOT hand-roll the dependency install — `host_setup.sh` is the tested
+single source of truth and is kept in sync with the Dockerfile.
+
 Sequence (per `bootstrap.sh`):
 
 1. **Env-var validation** (LLR-0032). Fail fast before downloading 17 GB.
