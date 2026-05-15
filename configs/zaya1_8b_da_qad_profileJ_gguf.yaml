@@ -33,15 +33,12 @@
 # K=3/V=2 is deferred until ggml-org/llama.cpp#20969 lands).
 #
 # Run command: bootstrap.sh with
-# `KDR_CONFIG=zaya1_8b_da_qad_profileJ_gguf.yaml` on 1× H200 (141 GB
-# VRAM) or 1× B200 (180 GB VRAM). VRAM budget at `trainable_scope:
-# full` is ~95–130 GB (teacher BF16 + student BF16 + STE
-# parametrization cache + 8-bit AdamW state + activations + KD
-# logits); 1× A100-80GB does NOT fit — the 4× A100-80GB fallback
-# from the NVFP4 reference YAML's launch comment is only valid for
-# recipes that fit in 80 GB per-device or that use multi-GPU
-# sharding (Profile-J's trainable_scope=full is single-GPU only and
-# needs ≥130 GB VRAM headroom).
+# `KDR_CONFIG=zaya1_8b_da_qad_profileJ_gguf.yaml` on 1× B200 (180 GB
+# VRAM) ONLY. The run is near-OOM even on a B200 (teacher BF16 +
+# student BF16 + STE parametrization cache + 8-bit AdamW state +
+# activations + KD logits); 1× H200 (141 GB) does NOT fit, and
+# neither does A100-80GB. Profile-J is single-GPU only — no
+# multi-GPU sharding path is validated.
 
 mode: da_qad
 
