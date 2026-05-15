@@ -200,7 +200,14 @@ distillation:
   # Probe the largest microbatch that fits VRAM at trainer init and rebalance
   # gradient_accumulation accordingly (tokens_per_step preserved). On B200
   # this typically buys 1.5-2× steady-state throughput.
-  auto_batch_size: true
+  #
+  # DISABLED for Profile-J: the init-time probe ran at warmup_sequence_length
+  # (2048) and picked a microbatch that left only ~0.8% VRAM headroom; once
+  # the schedule ramped toward sequence_length 4096, the Muon step + backward
+  # scratch starved the allocator and training wedged at step 2 (Phase 7.2
+  # Run-2). This recipe is near-OOM by design — run the fixed, conservative
+  # per_device_batch_size=1 / gradient_accumulation=32 instead.
+  auto_batch_size: false
   # Async save_partial — overlaps the rank-0 disk-write with the next
   # forward+backward, saving ~10-30 s per partial on 8B BF16. Matches
   # the bf16_recovery config; the cost is ~weight-tensor-size of CPU
